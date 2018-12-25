@@ -1,11 +1,10 @@
 package seal.happy.isolation
 
-import org.jetbrains.exposed.dao.IntIdTable
 import org.jetbrains.exposed.sql.*
-import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.Test
 import java.sql.Connection
 import java.time.Duration
@@ -16,15 +15,9 @@ import kotlin.concurrent.thread
 class TransactionIsolationTests {
     @BeforeEach
     fun setup() {
-        Database.connect(
-            "jdbc:mysql://localhost:3307/test",
-            driver = "com.mysql.jdbc.Driver",
-            user = "root",
-            password = "test"
-        )
+        connect()
 
         transaction {
-            SchemaUtils.create(KeyValue)
             KeyValue.deleteAll()
         }
     }
@@ -54,12 +47,37 @@ class TransactionIsolationTests {
         assertTrue(tryPerformWriteSkew(Connection.TRANSACTION_REPEATABLE_READ))
     }
 
-//    @Test
-//    fun `write skew, serializable`() {
-//        assertTimeoutPreemptively(Duration.ofSeconds(5)) {
-//            tryPerformWriteSkew(Connection.TRANSACTION_SERIALIZABLE)
-//        }
-//    }
+    @Test
+    @Disabled
+    fun `write skew, serializable`() {
+        assertTimeoutPreemptively(Duration.ofSeconds(5)) {
+            tryPerformWriteSkew(Connection.TRANSACTION_SERIALIZABLE)
+        }
+    }
+
+    @Test
+    fun `concurrent increment, read uncommitted`() {
+        val result = performConcurrentIncrement(Connection.TRANSACTION_READ_UNCOMMITTED, iterations = 1000)
+        assertNotEquals(1000, result)
+    }
+
+    @Test
+    fun `concurrent increment, read committed`() {
+        val result = performConcurrentIncrement(Connection.TRANSACTION_READ_COMMITTED, iterations = 1000)
+        assertNotEquals(1000, result)
+    }
+
+    @Test
+    fun `concurrent increment, repeatable read`() {
+        val result = performConcurrentIncrement(Connection.TRANSACTION_REPEATABLE_READ, iterations = 1000)
+        assertNotEquals(1000, result)
+    }
+
+    @Test
+    fun `concurrent increment, serializable`() {
+        val result = performConcurrentIncrement(Connection.TRANSACTION_SERIALIZABLE, iterations = 1000)
+        assertEquals(1000, result)
+    }
 
     private fun tryPerformDirtyRead(transactionIsolation: Int): Boolean {
         val pinkValue = AtomicInteger()
@@ -179,13 +197,35 @@ class TransactionIsolationTests {
         return pinkCount == 2
     }
 
+    private fun performConcurrentIncrement(transactionIsolation: Int, iterations: Int = 1000): Int {
+        transaction(transactionIsolation) {
+            KeyValue.insert {
+                it[key] = "orange"
+                it[value] = 0
+            }
+        }
 
-}
+        val pool = Executors.newFixedThreadPool(Math.max(Runtime.getRuntime().availableProcessors(), 8))
+        val completedTransactions = AtomicInteger()
 
-fun <T> transaction(transactionIsolation: Int, statement: Transaction.() -> T): T =
-    transaction(transactionIsolation, TransactionManager.manager.defaultRepetitionAttempts, null, statement)
+        for (i in 1..iterations) {
+            pool.submit {
+                transaction(transactionIsolation, repetitionAttempts = iterations) {
+                    val count = KeyValue.select { KeyValue.key eq "orange" }.first()[KeyValue.value]
+                    KeyValue.update(where = { KeyValue.key eq "orange" }) { it[value] = count + 1 }
+                }
 
-object KeyValue : IntIdTable() {
-    val key = varchar("key_", 50)
-    val value = integer("value").default(0)
+                completedTransactions.incrementAndGet()
+            }
+        }
+
+        pool.shutdown()
+        pool.awaitTermination(1, TimeUnit.MINUTES)
+
+        assertEquals(iterations, completedTransactions.get())
+
+        return transaction(transactionIsolation) {
+            KeyValue.select { KeyValue.key eq "orange" }.first()[KeyValue.value]
+        }
+    }
 }
