@@ -13,6 +13,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 class TransactionIsolationTests {
+    private val aliceToBob = LinkedBlockingDeque<Unit>(1)
+    private val bobToAlice = LinkedBlockingDeque<Unit>(1)
+
     @BeforeEach
     fun setup() {
         connect()
@@ -81,22 +84,14 @@ class TransactionIsolationTests {
 
     private fun tryPerformDirtyRead(transactionIsolation: Int): Boolean {
         val pinkValue = AtomicInteger()
-        val aliceToBob = LinkedBlockingDeque<Unit>(1)
-        val bobToAlice = LinkedBlockingDeque<Unit>(1)
-
         val committedValue = 1
         val uncommittedValue = 2
 
-        transaction {
-            KeyValue.insert {
-                it[key] = "pink"
-                it[value] = committedValue
-            }
-        }
+        insert("pink", committedValue)
 
         val aliceThread = thread {
             transaction(transactionIsolation) {
-                seal.happy.isolation.KeyValue.update(where = { KeyValue.key eq "pink" }) {
+                KeyValue.update(where = { KeyValue.key eq "pink" }) {
                     it[value] = uncommittedValue
                 }
 
@@ -108,7 +103,7 @@ class TransactionIsolationTests {
         val bobThread = thread {
             transaction(transactionIsolation) {
                 aliceToBob.take()
-                pinkValue.set(seal.happy.isolation.KeyValue.select { KeyValue.key eq "pink" }.first()[KeyValue.value])
+                pinkValue.set(KeyValue.select { KeyValue.key eq "pink" }.first()[KeyValue.value])
                 bobToAlice.add(Unit)
             }
         }
@@ -120,21 +115,13 @@ class TransactionIsolationTests {
     }
 
     private fun tryPerformNonRepeatableRead(transactionIsolation: Int): Boolean {
-        val aliceToBob = LinkedBlockingDeque<Unit>(1)
-        val bobToAlice = LinkedBlockingDeque<Unit>(1)
-
-        transaction {
-            KeyValue.insert {
-                it[key] = "teal"
-                it[value] = 1
-            }
-        }
+        insert("teal", 1)
 
         val aliceThread = thread {
             transaction(transactionIsolation) {
                 bobToAlice.take()
 
-                seal.happy.isolation.KeyValue.update(where = { KeyValue.key eq "teal" }) {
+                KeyValue.update(where = { KeyValue.key eq "teal" }) {
                     it[value] = 2
                 }
             }
@@ -147,12 +134,12 @@ class TransactionIsolationTests {
 
         val bobThread = thread {
             transaction(transactionIsolation) {
-                firstReadValue.set(seal.happy.isolation.KeyValue.select { KeyValue.key eq "teal" }.first()[KeyValue.value])
+                firstReadValue.set(KeyValue.select { KeyValue.key eq "teal" }.first()[KeyValue.value])
 
                 bobToAlice.add(Unit)
                 aliceToBob.take()
 
-                secondReadValue.set(seal.happy.isolation.KeyValue.select { KeyValue.key eq "teal" }.first()[KeyValue.value])
+                secondReadValue.set(KeyValue.select { KeyValue.key eq "teal" }.first()[KeyValue.value])
             }
         }
 
@@ -163,14 +150,14 @@ class TransactionIsolationTests {
     }
 
     private fun tryPerformWriteSkew(transactionIsolation: Int): Boolean {
-        val aliceToBob = LinkedBlockingDeque<Unit>(1)
-        val bobToAlice = LinkedBlockingDeque<Unit>(1)
+        insert("orange", 0)
 
         val aliceThread = thread {
             transaction(transactionIsolation) {
                 bobToAlice.take()
 
-                seal.happy.isolation.KeyValue.insert { it[key] = "pink" }
+                val count = KeyValue.select { KeyValue.key eq "orange" }.first()[KeyValue.value]
+                KeyValue.update(where = { KeyValue.key eq "orange" }) { it[value] = count + 1 }
             }
 
             aliceToBob.add(Unit)
@@ -178,32 +165,24 @@ class TransactionIsolationTests {
 
         val bobThread = thread {
             transaction(transactionIsolation) {
-                val pinkCount =
-                    seal.happy.isolation.KeyValue.select { KeyValue.key eq "pink" }.count()
+                val count = KeyValue.select { KeyValue.key eq "orange" }.first()[KeyValue.value]
 
                 bobToAlice.add(Unit)
                 aliceToBob.take()
 
-                if (pinkCount == 0) {
-                    seal.happy.isolation.KeyValue.insert { it[key] = "pink" }
-                }
+                KeyValue.update(where = { KeyValue.key eq "orange" }) { it[value] = count + 1 }
             }
         }
 
         aliceThread.join()
         bobThread.join()
 
-        val pinkCount = transaction { KeyValue.select { KeyValue.key eq "pink" }.count() }
-        return pinkCount == 2
+        val count = transaction { KeyValue.select { KeyValue.key eq "orange" }.count() }
+        return count == 1
     }
 
     private fun performConcurrentIncrement(transactionIsolation: Int, iterations: Int = 1000): Int {
-        transaction(transactionIsolation) {
-            KeyValue.insert {
-                it[key] = "orange"
-                it[value] = 0
-            }
-        }
+        insert("orange", 0)
 
         val pool = Executors.newFixedThreadPool(Math.max(Runtime.getRuntime().availableProcessors(), 8))
         val completedTransactions = AtomicInteger()
@@ -226,6 +205,13 @@ class TransactionIsolationTests {
 
         return transaction(transactionIsolation) {
             KeyValue.select { KeyValue.key eq "orange" }.first()[KeyValue.value]
+        }
+    }
+
+    private fun insert(key: String, value: Int) = transaction {
+        KeyValue.insert {
+            it[this.key] = key
+            it[this.value] = value
         }
     }
 }
